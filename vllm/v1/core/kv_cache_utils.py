@@ -695,6 +695,20 @@ def check_enough_kv_cache_memory(vllm_config: VllmConfig,
     if not kv_cache_spec:
         return
 
+    # Skip memory checks when UVM is enabled (allows oversubscription)
+    try:
+        from vllm.device_allocator.uvm import is_uvm_enabled
+        if is_uvm_enabled():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "UVM is enabled - skipping KV cache memory check. "
+                "Memory oversubscription is allowed but may cause slowdown."
+            )
+            return
+    except ImportError:
+        pass
+
     if available_memory <= 0:
         raise ValueError("No available memory for the cache blocks. "
                          "Try increasing `gpu_memory_utilization` when "
@@ -823,6 +837,26 @@ def get_num_blocks(vllm_config: VllmConfig, num_layers: int,
     """
     num_blocks = int(available_memory // page_size // num_layers)
     num_blocks = max(num_blocks, 0)
+
+    # When UVM is enabled and available memory is exhausted,
+    # allocate minimum blocks for oversubscription
+    if num_blocks == 0:
+        try:
+            from vllm.device_allocator.uvm import is_uvm_enabled
+            if is_uvm_enabled():
+                # Calculate blocks needed for max_model_len
+                block_size = vllm_config.cache_config.block_size
+                max_model_len = vllm_config.model_config.max_model_len
+                # Need enough blocks for at least one request
+                min_blocks = (max_model_len + block_size - 1) // block_size
+                num_blocks = min_blocks
+                logger.warning(
+                    "UVM enabled: allocating %d blocks for oversubscription "
+                    "(available_memory=%d)", num_blocks, available_memory
+                )
+        except ImportError:
+            pass
+
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
 

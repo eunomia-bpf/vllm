@@ -21,3 +21,24 @@ os.environ['PYTORCH_NVML_BASED_CUDA_CHECK'] = '1'
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 # see https://github.com/vllm-project/vllm/issues/10619
 torch._inductor.config.compile_threads = 1
+
+# Enable UVM (Unified Virtual Memory) allocator if requested
+# This MUST happen before any CUDA memory allocations
+# UVM allows memory oversubscription but with significant performance overhead
+if os.environ.get("VLLM_USE_UVM", "0").lower() in ("1", "true", "yes"):
+    try:
+        from vllm.device_allocator.uvm import enable_uvm_allocator
+        enable_prefetch = os.environ.get(
+            "VLLM_UVM_PREFETCH", "0"
+        ).lower() in ("1", "true", "yes")
+        verbose = os.environ.get(
+            "VLLM_UVM_VERBOSE", "0"
+        ).lower() in ("1", "true", "yes")
+        enable_uvm_allocator(enable_prefetch=enable_prefetch, verbose=verbose)
+        logger.warning(
+            "UVM allocator is enabled. This allows memory oversubscription "
+            "but has significant performance overhead. "
+            "NOT recommended for production use."
+        )
+    except Exception as e:
+        logger.error("Failed to enable UVM allocator: %s", e)

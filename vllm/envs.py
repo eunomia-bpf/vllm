@@ -206,6 +206,10 @@ if TYPE_CHECKING:
     VLLM_NCCL_INCLUDE_PATH: Optional[str] = None
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
+    # UVM (Unified Virtual Memory) settings
+    VLLM_USE_UVM: bool = False
+    VLLM_UVM_PREFETCH: bool = False
+    VLLM_UVM_VERBOSE: bool = False
 
 
 def get_default_cache_root():
@@ -1483,6 +1487,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+
+    # UVM (Unified Virtual Memory) settings
+    # Enable CUDA UVM allocator for memory oversubscription
+    # WARNING: UVM has significant performance overhead and is NOT recommended
+    # for production use. It's useful for testing large models on smaller GPUs.
+    "VLLM_USE_UVM":
+    lambda: os.environ.get("VLLM_USE_UVM", "0").lower() in ("1", "true", "yes"),
+
+    # Enable prefetching for UVM allocations (can improve performance but
+    # uses more GPU memory)
+    "VLLM_UVM_PREFETCH":
+    lambda: os.environ.get("VLLM_UVM_PREFETCH", "0").lower() in
+    ("1", "true", "yes"),
+
+    # Enable verbose logging for UVM allocations (logs large allocations)
+    "VLLM_UVM_VERBOSE":
+    lambda: os.environ.get("VLLM_UVM_VERBOSE", "0").lower() in
+    ("1", "true", "yes"),
 }
 
 # --8<-- [end:env-vars-definition]

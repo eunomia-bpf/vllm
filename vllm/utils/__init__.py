@@ -2727,8 +2727,26 @@ class MemorySnapshot:
         # After `torch.cuda.reset_peak_memory_stats()`,
         # `torch.cuda.memory_reserved()` will keep growing, and only shrink
         # when we call `torch.cuda.empty_cache()` or OOM happens.
-        self.torch_peak = torch.cuda.memory_stats().get(
-            "allocated_bytes.all.peak", 0)
+
+        # Check if UVM allocator is enabled - if so, use UVM stats instead
+        # of PyTorch stats (which don't work with CUDAPluggableAllocator)
+        uvm_stats = self._get_uvm_stats()
+        if uvm_stats is not None:
+            self.torch_peak = uvm_stats.get('peak_bytes', 0)
+            self.free_memory, self.total_memory = torch.cuda.mem_get_info()
+            self.cuda_memory = uvm_stats.get('allocated_bytes', 0)
+            self.torch_memory = self.cuda_memory
+            self.non_torch_memory = 0
+            self.timestamp = time.time()
+            return
+
+        try:
+            self.torch_peak = torch.cuda.memory_stats().get(
+                "allocated_bytes.all.peak", 0)
+        except RuntimeError:
+            # CUDAPluggableAllocator (e.g., UVM) doesn't support memory_stats
+            # Use 0 as fallback
+            self.torch_peak = 0
 
         self.free_memory, self.total_memory = torch.cuda.mem_get_info()
         self.cuda_memory = self.total_memory - self.free_memory
@@ -2736,10 +2754,25 @@ class MemorySnapshot:
         # torch.cuda.memory_reserved() is how many bytes
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
-        self.torch_memory = torch.cuda.memory_reserved()
+        try:
+            self.torch_memory = torch.cuda.memory_reserved()
+        except RuntimeError:
+            # CUDAPluggableAllocator may not support this
+            self.torch_memory = 0
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
+
+    @staticmethod
+    def _get_uvm_stats():
+        """Get UVM stats if UVM allocator is enabled, otherwise return None."""
+        try:
+            from vllm.device_allocator.uvm import is_uvm_enabled, get_uvm_stats
+            if is_uvm_enabled():
+                return get_uvm_stats()
+        except ImportError:
+            pass
+        return None
 
     def __sub__(self, other: MemorySnapshot) -> MemorySnapshot:
         return MemorySnapshot(
@@ -2830,7 +2863,11 @@ def memory_profiling(
     """  # noqa
     gc.collect()
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except RuntimeError:
+        # CUDAPluggableAllocator (e.g., UVM) doesn't support this
+        pass
 
     result = MemoryProfilingResult()
 

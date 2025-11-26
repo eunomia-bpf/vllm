@@ -252,7 +252,11 @@ class Worker(WorkerBase):
             return kv_cache_memory_bytes
 
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except RuntimeError:
+            # CUDAPluggableAllocator (e.g., UVM) doesn't support this
+            pass
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -299,7 +303,7 @@ class Worker(WorkerBase):
                     GiB(self.available_kv_cache_memory_bytes))
         gc.collect()
 
-        return int(self.available_kv_cache_memory_bytes)
+        return int(self.available_kv_cache_memory_bytes) # 128 * 1024 * 1024 *1024 #
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()

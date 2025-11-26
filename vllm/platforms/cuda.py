@@ -199,8 +199,28 @@ class CudaPlatformBase(Platform):
                                  device: Optional[torch.types.Device] = None
                                  ) -> float:
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-        return torch.cuda.max_memory_allocated(device)
+
+        # Check if UVM allocator is enabled - if so, use UVM stats
+        # (PyTorch's memory_stats doesn't work with CUDAPluggableAllocator)
+        try:
+            from vllm.device_allocator.uvm import is_uvm_enabled, get_uvm_stats
+            if is_uvm_enabled():
+                stats = get_uvm_stats()
+                return stats.get('peak_bytes', 0)
+        except ImportError:
+            pass
+
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except RuntimeError:
+            # CUDAPluggableAllocator (e.g., UVM) doesn't support this
+            pass
+
+        try:
+            return torch.cuda.max_memory_allocated(device)
+        except RuntimeError:
+            # CUDAPluggableAllocator doesn't support getDeviceStats
+            return 0
 
     @classmethod
     def get_vit_attn_backend(cls, head_size: int,
