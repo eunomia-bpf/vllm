@@ -232,6 +232,17 @@ class Worker(WorkerBase):
             by adjusting the `gpu_memory_utilization` parameter.
         """
         GiB = lambda b: b / GiB_bytes
+        try:
+            from vllm.device_allocator.uvm import is_uvm_enabled
+            if is_uvm_enabled():
+                import os
+                uvm_kv_size_gb = float(os.environ.get("VLLM_UVM_KV_CACHE_SIZE_GB", "6"))
+                uvm_kv_size_bytes = int(uvm_kv_size_gb * 1024 * 1024 * 1024)
+                print(f"UVM enabled: setting KV cache size to {uvm_kv_size_gb} GB")
+                return uvm_kv_size_bytes
+        except ImportError:
+            pass
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

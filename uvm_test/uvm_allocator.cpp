@@ -14,6 +14,10 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <atomic>
+#include <ctime>
+#include <chrono>
+#include <mutex>
+#include <cstdlib>
 
 extern "C" {
 
@@ -27,6 +31,102 @@ static std::atomic<size_t> num_frees{0};
 static int enable_prefetch = 0;  // Whether to prefetch to device after allocation
 static int verbose_logging = 0;  // Whether to log allocations
 
+// Log file handling
+static FILE* log_file = nullptr;
+static std::mutex log_mutex;
+static std::chrono::steady_clock::time_point start_time;
+static bool log_initialized = false;
+
+/**
+ * Get current timestamp string
+ */
+static void get_timestamp(char* buffer, size_t size) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+
+    struct tm* tm_info = localtime(&time_t_now);
+    size_t len = strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
+    snprintf(buffer + len, size - len, ".%03ld", (long)ms.count());
+}
+
+/**
+ * Get elapsed time since start in seconds
+ */
+static double get_elapsed_seconds() {
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(now - start_time).count();
+}
+
+/**
+ * Initialize log file (called once on first allocation)
+ */
+static void init_log_file() {
+    if (log_initialized) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (log_initialized) return;  // Double-check after acquiring lock
+
+    start_time = std::chrono::steady_clock::now();
+
+    // Check environment variable for log file path
+    const char* log_path = getenv("VLLM_UVM_LOG_FILE");
+    if (!log_path) {
+        log_path = "vllm_uvm_allocations.log";
+    }
+
+    log_file = fopen(log_path, "a");
+    if (log_file) {
+        char timestamp[64];
+        get_timestamp(timestamp, sizeof(timestamp));
+        fprintf(log_file, "\n========================================\n");
+        fprintf(log_file, "[%s] vLLM UVM Allocator Session Started\n", timestamp);
+        fprintf(log_file, "========================================\n");
+        fflush(log_file);
+    } else {
+        fprintf(stderr, "[vLLM UVM] Warning: Could not open log file: %s\n", log_path);
+    }
+
+    log_initialized = true;
+}
+
+/**
+ * Log allocation to file
+ */
+static void log_allocation(const char* type, size_t size, size_t alloc_num,
+                           size_t current_total, size_t peak, int device) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+
+    fprintf(log_file, "[%s] [+%.3fs] %s #%zu: %.2f MB | device: %d | total: %.2f GB | peak: %.2f GB\n",
+            timestamp, elapsed, type, alloc_num, size / 1e6, device,
+            current_total / 1e9, peak / 1e9);
+    fflush(log_file);
+}
+
+/**
+ * Log free to file
+ */
+static void log_free(size_t size, size_t free_num, size_t current_total, int device) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+
+    fprintf(log_file, "[%s] [+%.3fs] FREE #%zu: %.2f MB | device: %d | total: %.2f GB\n",
+            timestamp, elapsed, free_num, size / 1e6, device, current_total / 1e9);
+    fflush(log_file);
+}
+
 /**
  * Allocate CUDA managed (UVM) memory
  *
@@ -38,6 +138,11 @@ static int verbose_logging = 0;  // Whether to log allocations
  * @return Pointer to allocated memory, or NULL on failure
  */
 void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
+    // Initialize log file on first allocation
+    if (!log_initialized) {
+        init_log_file();
+    }
+
     void* ptr = NULL;
     cudaError_t err;
 
@@ -63,7 +168,12 @@ void* uvm_malloc(ssize_t size, int device, cudaStream_t stream) {
         }
     }
 
-    // Log large allocations (> 100MB)
+    // Log large allocations (> 100MB) to file
+    if (size > 100 * 1024 * 1024) {
+        log_allocation("ALLOC", size, alloc_count, current, peak_allocated.load(), device);
+    }
+
+    // Also log to stderr if verbose logging is enabled
     if (verbose_logging && size > 100 * 1024 * 1024) {
         fprintf(stderr, "[vLLM UVM] Alloc #%zu: %.2f MB (total: %.2f GB, peak: %.2f GB)\n",
                 alloc_count, size / 1e6, current / 1e9,
@@ -96,8 +206,13 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
         }
 
         // Update statistics
-        total_allocated.fetch_sub(size);
-        num_frees.fetch_add(1);
+        size_t current = total_allocated.fetch_sub(size) - size;
+        size_t free_count = num_frees.fetch_add(1) + 1;
+
+        // Log large frees (> 100MB) to file
+        if (size > 100 * 1024 * 1024) {
+            log_free(size, free_count, current, device);
+        }
     }
 }
 
@@ -162,6 +277,47 @@ void uvm_set_prefetch(int enabled) {
  */
 void uvm_set_verbose(int enabled) {
     verbose_logging = enabled;
+}
+
+/**
+ * Flush and close the log file, writing a summary
+ */
+void uvm_close_log(void) {
+    if (!log_file) return;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    double elapsed = get_elapsed_seconds();
+
+    fprintf(log_file, "========================================\n");
+    fprintf(log_file, "[%s] Session Summary (duration: %.2fs)\n", timestamp, elapsed);
+    fprintf(log_file, "  Total allocations: %zu\n", num_allocs.load());
+    fprintf(log_file, "  Total frees: %zu\n", num_frees.load());
+    fprintf(log_file, "  Current allocated: %.2f GB\n", total_allocated.load() / 1e9);
+    fprintf(log_file, "  Peak allocated: %.2f GB\n", peak_allocated.load() / 1e9);
+    fprintf(log_file, "========================================\n\n");
+
+    fflush(log_file);
+    fclose(log_file);
+    log_file = nullptr;
+    log_initialized = false;
+}
+
+/**
+ * Set custom log file path (must be called before first allocation)
+ */
+void uvm_set_log_file(const char* path) {
+    if (log_initialized) {
+        fprintf(stderr, "[vLLM UVM] Warning: Cannot change log file after initialization\n");
+        return;
+    }
+    // The log path is read from VLLM_UVM_LOG_FILE environment variable in init_log_file()
+    // This function is provided for programmatic control if needed
+    if (path) {
+        setenv("VLLM_UVM_LOG_FILE", path, 1);
+    }
 }
 
 /**
