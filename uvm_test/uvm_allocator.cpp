@@ -216,6 +216,14 @@ void uvm_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
     }
 }
 
+void* uvm_kv_malloc(ssize_t size, int device, cudaStream_t stream) {
+    return uvm_malloc(size, device, stream);
+}
+
+void uvm_kv_free(void* ptr, ssize_t size, int device, cudaStream_t stream) {
+    uvm_free(ptr, size, device, stream);
+}
+
 // =============================================================================
 // Statistics API (can be called from Python via ctypes)
 // =============================================================================
